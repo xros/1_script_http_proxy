@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-High‑performance asyncio HTTP/HTTPS proxy – transparent LAN support.
-
-Now strips hop‑by‑hop headers (Proxy‑Connection etc.) so that simple
-LAN devices (like NAS, cameras) work perfectly.
+High‑performance asyncio HTTP/HTTPS proxy – dual‑stack, streaming, overload protection.
+Now with longer default connect timeout (30s) and explicit error details.
 
 Usage:
     python3 proxy.py
-    (listens on [::]:8080 – dual‑stack, IPv4+IPv6)
+    (listens on [::]:8080, fully configurable via environment variables)
 """
 
 import asyncio
@@ -24,7 +22,7 @@ PROXY_PORT      = int(os.environ.get("PROXY_PORT", 8080))
 CHUNK_SIZE      = 65536                # 64 KB streaming chunks
 MAX_CONNECTIONS = int(os.environ.get("MAX_CONNS", 500))
 IDLE_TIMEOUT    = int(os.environ.get("IDLE_TIMEOUT", 60))        # seconds
-CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", 10))     # seconds
+CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", 30))     # seconds – longer default
 ACQUIRE_TIMEOUT = int(os.environ.get("ACQUIRE_TIMEOUT", 10))     # semaphore wait
 
 # ANSI colors for terminal output
@@ -84,42 +82,6 @@ def parse_connect_host_port(target: str):
         return host, port
 
 # ------------------------------
-# Header sanitisation (fix for LAN devices)
-# ------------------------------
-def sanitise_headers(headers: dict, target_host: str, target_port: int) -> dict:
-    """
-    Remove hop‑by‑hop headers and rebuild a correct Host header.
-    This makes the proxy transparent to simple servers (e.g. embedded devices).
-    """
-    # Hop‑by‑hop headers that must not be forwarded
-    hop_by_hop = {
-        "proxy-connection",
-        "connection",
-        "keep-alive",
-        "transfer-encoding",
-        "te",
-        "trailer",
-        "upgrade",
-    }
-    clean = {}
-    for name, value in headers.items():
-        if name.lower() in hop_by_hop:
-            continue
-        clean[name] = value
-
-    # Rebuild Host header (required by HTTP/1.1)
-    # Include port only if it's non‑default
-    if target_port == 80:
-        clean["host"] = target_host
-    else:
-        clean["host"] = f"{target_host}:{target_port}"
-
-    # Mark the request as having passed through us
-    clean["via"] = "1.1 python-asyncio-proxy"
-
-    return clean
-
-# ------------------------------
 # Low‑level I/O helpers (with timeouts)
 # ------------------------------
 async def read_headers(reader: asyncio.StreamReader) -> dict:
@@ -165,7 +127,6 @@ async def copy_chunked(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 if trailer in (b"\r\n", b"\n", b""):
                     break
             break
-        # Stream chunk data in smaller parts
         remaining = chunk_size + 2
         while remaining > 0:
             try:
@@ -212,12 +173,20 @@ async def relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
         writer.close()
 
 # ------------------------------
-# Connection handlers
+# Improved error responses
 # ------------------------------
-async def safe_write_response(writer: asyncio.StreamWriter, response: bytes):
-    """Write an HTTP error response and close the socket safely."""
+async def safe_write_response(writer: asyncio.StreamWriter, status_line: bytes, body: str = ""):
+    """Write an HTTP error response with an optional informative body, then close."""
     try:
-        writer.write(response)
+        writer.write(status_line)
+        if body:
+            body_bytes = body.encode(errors="replace")
+            writer.write(f"Content-Length: {len(body_bytes)}\r\n".encode())
+            writer.write(b"Content-Type: text/plain\r\n")
+            writer.write(b"\r\n")
+            writer.write(body_bytes)
+        else:
+            writer.write(b"Content-Length: 0\r\n\r\n")
         await asyncio.wait_for(writer.drain(), timeout=5)
     except Exception:
         pass
@@ -241,8 +210,20 @@ async def handle_connect(
             timeout=CONNECT_TIMEOUT
         )
     except Exception as e:
-        log_error(f"{client_addr} -> CONNECT {host}:{port} FAILED ({e})")
-        await safe_write_response(client_writer, b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        # Better error logging: show type and message (or type if message empty)
+        error_detail = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}"
+        log_error(f"{client_addr} -> CONNECT {host}:{port} FAILED ({error_detail})")
+        body = (
+            f"Upstream connection failed while establishing tunnel to {host}:{port}.\n"
+            f"Error: {error_detail}\n\n"
+            f"Check that the service is running and reachable on this port.\n"
+            f"If the service uses HTTPS, ensure it supports TLS on this port."
+        )
+        await safe_write_response(
+            client_writer,
+            b"HTTP/1.1 502 Bad Gateway\r\n",
+            body
+        )
         return
 
     try:
@@ -297,9 +278,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             host, port = parse_connect_host_port(url)
         except ValueError as e:
             log_warning(f"{client_addr} -> CONNECT BAD URL: {url} ({e})")
-            await safe_write_response(writer, b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await safe_write_response(writer, b"HTTP/1.1 400 Bad Request\r\n")
             return
-
         await read_headers(reader)
         await handle_connect(reader, writer, host, port, client_addr)
         return
@@ -310,7 +290,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     parsed = urlparse(url)
     if parsed.scheme not in ("http", ""):
         log_warning(f"{client_addr} -> UNSUPPORTED SCHEME: {parsed.scheme}")
-        await safe_write_response(writer, b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        await safe_write_response(writer, b"HTTP/1.1 400 Bad Request\r\n")
         return
 
     host = parsed.hostname or headers.get("host", "localhost")
@@ -318,9 +298,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     path = parsed.path or "/"
     if parsed.query:
         path += f"?{parsed.query}"
-
-    # Sanitise headers (removes hop‑by‑hop, fixes Host)
-    clean_headers = sanitise_headers(headers, host, port)
 
     log_info(f"{client_addr} -> {method} {host}:{port}{path}")
 
@@ -330,15 +307,28 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             timeout=CONNECT_TIMEOUT
         )
     except Exception as e:
-        log_error(f"{client_addr} -> {method} {host}:{port}{path} FAILED ({e})")
-        await safe_write_response(writer, b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        error_detail = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}"
+        log_error(f"{client_addr} -> {method} {host}:{port}{path} FAILED ({error_detail})")
+        body = (
+            f"Failed to connect to upstream server {host}:{port}.\n"
+            f"Error: {error_detail}\n\n"
+            f"Possible reasons:\n"
+            f" - No service listening on port {port}\n"
+            f" - Firewall blocking the connection\n"
+            f" - The service requires HTTPS (try using https:// instead)\n"
+            f" - Service requires a different port (e.g., :8080)"
+        )
+        await safe_write_response(
+            writer,
+            b"HTTP/1.1 502 Bad Gateway\r\n",
+            body
+        )
         return
 
-    # Forward request line and sanitised headers
     try:
         req_line = f"{method} {path} {version}\r\n".encode()
         remote_writer.write(req_line)
-        await write_headers(remote_writer, clean_headers)
+        await write_headers(remote_writer, headers)
 
         content_length = headers.get("content-length")
         transfer_encoding = headers.get("transfer-encoding", "")
@@ -356,7 +346,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         writer.close()
         return
 
-    # Read response status line
     try:
         status_line = await asyncio.wait_for(remote_reader.readline(), timeout=IDLE_TIMEOUT)
         if not status_line:
@@ -374,7 +363,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     resp_headers = await read_headers(remote_reader)
     await write_headers(writer, resp_headers)
 
-    # WebSocket upgrade detection
     status_code = int(status_line.decode().split()[1])
     upgrade = resp_headers.get("upgrade", "").lower()
     if status_code == 101 and upgrade == "websocket":
@@ -388,7 +376,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         writer.close()
         return
 
-    # Relay response body (streaming)
     resp_cl = resp_headers.get("content-length")
     resp_te = resp_headers.get("transfer-encoding", "")
     resp_chunked = "chunked" in resp_te.lower()
@@ -413,13 +400,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 _conn_sem = asyncio.Semaphore(MAX_CONNECTIONS)
 
 async def limited_handle_client(reader, writer):
+    """Wrapper that enforces concurrent connection limit with a timeout."""
     try:
         acquired = await asyncio.wait_for(_conn_sem.acquire(), timeout=ACQUIRE_TIMEOUT)
     except asyncio.TimeoutError:
         log_warning("Proxy overloaded – rejecting new connection (503)")
         await safe_write_response(
             writer,
-            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+            b"HTTP/1.1 503 Service Unavailable\r\n"
         )
         return
     try:
