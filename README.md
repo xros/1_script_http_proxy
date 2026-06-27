@@ -6,8 +6,8 @@
 `python3 proxy.py`
 Default port 8080
 
-Or you want to define ports and max connections
+Or you want to define the proxy port, max connections, connection timeout
 
 ```bash
-PROXY_PORT=8080 MAX_CONNS=500 python3 proxy.py
+PROXY_PORT=8080 MAX_CONNS=500 CONNECT_TIMEOUT=60 python3 proxy.py
 ```
